@@ -77,14 +77,14 @@ impl Display for Args {
             writeln!(f, "Size >= {}", size)?;
         }
 
-        let map_or = |s: Option<NonZeroU32>| s.map_or(String::from("-"), |s| s.to_string());
+        let map_or = |s: Option<NonZeroU32>| s.map_or(String::from("~"), |s| s.to_string());
 
         let maxw = map_or(self.max_width);
         let maxh = map_or(self.max_height);
 
         writeln!(
             f,
-            "Pixel range: {}x{} px - {}x{} px",
+            "Pixel range: {} x {} px - {} x {} px",
             self.min_width, self.min_height, maxw, maxh
         )?;
 
