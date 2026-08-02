@@ -15,10 +15,10 @@ pub struct Args {
     pub size: Option<String>,
 
     #[arg(long, global = true, default_value_t = 0)]
-    pub min_width: u32,
+    pub min_width: usize,
 
     #[arg(long, global = true, default_value_t = 0)]
-    pub min_height: u32,
+    pub min_height: usize,
 
     #[arg(long, global = true)]
     pub max_width: Option<NonZeroU32>,

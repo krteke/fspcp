@@ -1,16 +1,19 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use clap::Parser;
-use crossfire::{
-    MTx,
-    mpsc::{self, Array},
-};
+use crossfire::mpmc;
 use ignore::WalkBuilder;
 use parse_size::parse_size;
-use std::{ffi::OsStr, mem, path::PathBuf, sync::Arc, thread};
+use std::{
+    ffi::OsStr,
+    path::PathBuf,
+    sync::Arc,
+    thread::{self, JoinHandle},
+};
 
-use crate::cli::{args::Args, commands::Commands};
+use crate::cli::{args::Args, batch::BatchSender, commands::Commands};
 
 mod args;
+mod batch;
 mod commands;
 
 #[derive(Debug, Parser)]
@@ -46,19 +49,66 @@ impl Cli {
 
                 move |entry| !excludes.iter().any(|e| entry.path().starts_with(e))
             });
+        let cpus = num_cpus::get();
 
-        let (tx, rx) = mpsc::bounded_blocking::<Vec<PathBuf>>(1024);
+        let (tx, rx) = mpmc::bounded_blocking::<Vec<PathBuf>>(cpus * 16);
+        let (ptx, prx) = mpmc::bounded_blocking::<Vec<PathBuf>>(cpus);
         let exts = Arc::new(args.extensions);
 
-        let files = thread::spawn(move || {
-            let mut files = Vec::new();
+        let recv = match self.command {
+            Commands::List => (0..1)
+                .map(|_| {
+                    let prx = prx.clone();
+                    thread::spawn(move || {
+                        while let Ok(p) = prx.recv() {
+                            p.iter().for_each(|p| {
+                                println!("{}", p.display());
+                            });
+                        }
+                    })
+                })
+                .collect::<Vec<_>>(),
+            Commands::Copy { outputs } => {
+                if outputs.is_empty() {
+                    return Ok(());
+                }
+                let outputs = Arc::new(outputs);
 
-            while let Ok(value) = rx.recv() {
-                files.extend(value);
+                (0..cpus)
+                    .map(|_| {
+                        let prx = prx.clone();
+                        thread::spawn(move || todo!())
+                    })
+                    .collect::<Vec<_>>()
             }
+        };
 
-            files
-        });
+        let handles = (0..cpus)
+            .map(|_| {
+                let rx = rx.clone();
+                let ptx = ptx.clone();
+
+                thread::spawn(move || {
+                    while let Ok(mut path) = rx.recv() {
+                        path.retain(|p| {
+                            imagesize::size(p).is_ok_and(|s| {
+                                let min = s.width >= args.min_width && s.height >= args.min_height;
+                                let maxw =
+                                    args.max_width.is_none_or(|w| s.width <= w.get() as usize);
+                                let maxh =
+                                    args.max_height.is_none_or(|h| s.height <= h.get() as usize);
+
+                                min && maxw && maxh
+                            })
+                        });
+
+                        if let Err(e) = ptx.send(path) {
+                            tracing::warn!("{e}")
+                        }
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
 
         let size = args.size.map_or(0, |size| {
             parse_size(&size).unwrap_or_else(|e| {
@@ -69,10 +119,7 @@ impl Cli {
 
         walker.build_parallel().run(|| {
             let exts = exts.clone();
-            let mut thread_files = ThreadFiles {
-                files: Vec::with_capacity(1024),
-                sender: tx.clone(),
-            };
+            let mut batch_sender = BatchSender::new(tx.clone());
 
             Box::new(move |result| {
                 match result {
@@ -94,7 +141,7 @@ impl Cli {
                             && let Ok(metadata) = metadata
                             && metadata.len() >= size
                         {
-                            thread_files.files.push(path);
+                            batch_sender.push(path);
                         }
                     }
                     Err(e) => tracing::error!("{e}"),
@@ -105,34 +152,22 @@ impl Cli {
         });
 
         drop(tx);
+        drop(ptx);
 
-        let files = files.join().unwrap_or_else(|e| {
-            tracing::warn!("{e:?}");
-            Vec::new()
-        });
+        let join_handle = |handles: Vec<JoinHandle<()>>| -> Result<()> {
+            for handle in handles {
+                handle
+                    .join()
+                    .map_err(|e| anyhow!("join handle error: {:?}", e))?;
+            }
+            Ok(())
+        };
 
-        self.command.run(&files)
+        join_handle(handles)?;
+        join_handle(recv)
     }
 
     pub fn verbose(&self) -> u8 {
         self.args.verbose
-    }
-}
-
-struct ThreadFiles {
-    files: Vec<PathBuf>,
-    sender: MTx<Array<Vec<PathBuf>>>,
-}
-
-impl Drop for ThreadFiles {
-    fn drop(&mut self) {
-        if self.files.is_empty() {
-            return;
-        }
-
-        let files = mem::take(&mut self.files);
-        if let Err(e) = self.sender.send(files) {
-            tracing::warn!("{e}")
-        }
     }
 }
